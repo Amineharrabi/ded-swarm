@@ -1,6 +1,6 @@
 # DED Swarm
 
-Decentralized N-node swarm layer for the DED project — the successor to the 2-node
+Decentralized N-node swarm layer for the DED project the successor to the 2-node
 websocket architecture in `DED_NodeA_v7.ipynb` / `DED_NodeB_v7.ipynb`.
 
 
