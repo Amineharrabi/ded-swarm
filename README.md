@@ -23,8 +23,8 @@ sh tests/local_swarm_demo.sh
 
 This starts a local relay + 3 nodes, lets them elect a leader, SIGKILLs
 the leader, and shows the survivors converging on a new one. Read the
-output — it's the same test that caught the split-brain bug documented
-in `docs/architecture.md`.
+output (same test that caught the split-brain bug documented
+in `docs/architecture.md`)
 
 To run nodes manually against the local relay:
 
