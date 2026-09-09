@@ -1,14 +1,9 @@
 # DED Swarm
 
-Decentralized N-node swarm layer for the DED (Distributed Diffusion LLM
-Collaborative Generation) project — the successor to the 2-node
+Decentralized N-node swarm layer for the DED project — the successor to the 2-node
 websocket architecture in `DED_NodeA_v7.ipynb` / `DED_NodeB_v7.ipynb`.
 
-**Status: membership and leadership only, proven working.** No diffusion
-logic yet — see `docs/architecture.md` for what exists, the design
-decisions behind it, and what's sequenced next.
 
-## What's here
 
 ```
 relay/relay.py      — stateless XSUB/XPUB message relay (run this on each Exoscale VPS)
@@ -20,8 +15,6 @@ node/node.py         — runnable swarm node (join/heartbeat/leader-detection/cl
 tests/local_swarm_demo.sh — end-to-end proof: 3 nodes, kill the leader, watch re-election
 docs/architecture.md — design decisions, and the split-brain bug this already caught once
 ```
-
-## Try it locally (no GPU, no Colab, no Exoscale needed)
 
 ```bash
 pip install -r requirements.txt
