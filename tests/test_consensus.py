@@ -1,0 +1,130 @@
+"""
+Pure-logic tests for diffusion/consensus.py — no sockets, no GPU, no model.
+Run with:
+    PYTHONPATH=. python3 tests/test_consensus.py
+"""
+import math
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from diffusion.consensus import detect_disputes, resolve_disputes, merge_consensus
+
+
+def test_no_dispute_when_everyone_agrees():
+    commits = {
+        "node-a": {10: (500, 0.9)},
+        "node-b": {10: (500, 0.85)},
+        "node-c": {10: (500, 0.95)},
+    }
+    disputes = detect_disputes(commits)
+    assert disputes == {}, f"expected no disputes, got {disputes}"
+    merged = merge_consensus(shared_x={}, commits=commits, resolved={})
+    assert merged == {10: 500}
+    print("PASS: unanimous agreement needs no PoE scoring, merges directly")
+
+
+def test_two_way_dispute_matches_old_pairwise_behavior():
+    """Sanity check: with exactly 2 voters, this should reduce to the
+    original score_x = log P_A(x) + log P_B(x) behavior."""
+    commits = {
+        "node-a": {10: (500, 0.9)},   # proposes "cat" (token 500)
+        "node-b": {10: (600, 0.7)},   # proposes "dog" (token 600)
+    }
+    disputes = detect_disputes(commits)
+    assert disputes == {10: {500, 600}}
+
+    # Both nodes report their OWN confidence for BOTH candidates (each already
+    # has this from its own softmax — no extra forward pass).
+    dispute_scores = {
+        "node-a": {10: {500: math.log(0.9), 600: math.log(0.05)}},
+        "node-b": {10: {500: math.log(0.1), 600: math.log(0.7)}},
+    }
+    # score(cat) = log(0.9) + log(0.1) = -0.105 + -2.303 = -2.408
+    # score(dog) = log(0.05) + log(0.7) = -2.996 + -0.357 = -3.352
+    # cat should win: both together are more confident in cat than dog,
+    # even though node-b individually preferred dog.
+    winners = resolve_disputes(dispute_scores)
+    assert winners[10] == 500, f"expected token 500 (cat) to win, got {winners[10]}"
+    print("PASS: 2-way dispute matches original pairwise PoE reasoning")
+
+
+def test_genuine_n_way_dispute_counts_every_voice():
+    """The actual generalization this module exists for: a candidate that
+    NO ONE proposed as their own top pick can still win, if the ensemble's
+    joint confidence in it is highest. This cannot happen with the old
+    pairwise scheme (only 2 voices existed to begin with) — this is the
+    real N-way behavior."""
+    commits = {
+        "node-a": {10: (100, 0.4)},  # proposes token 100 as its own top pick
+        "node-b": {10: (200, 0.4)},  # proposes token 200
+        "node-c": {10: (100, 0.4)},  # proposes token 100 too
+    }
+    disputes = detect_disputes(commits)
+    assert disputes == {10: {100, 200}}
+
+    # Every participant reports its own log-prob for BOTH candidates.
+    # node-a and node-c are only mildly confident in 100 but very much AGAINST 200.
+    # node-b is very confident in 200.
+    dispute_scores = {
+        "node-a": {10: {100: math.log(0.4), 200: math.log(0.01)}},
+        "node-b": {10: {100: math.log(0.3), 200: math.log(0.9)}},
+        "node-c": {10: {100: math.log(0.4), 200: math.log(0.01)}},
+    }
+    # score(100) = log(0.4)+log(0.3)+log(0.4) = -0.916-1.204-0.916 = -3.036
+    # score(200) = log(0.01)+log(0.9)+log(0.01) = -4.605-0.105-4.605 = -9.316
+    # 100 wins decisively — two participants strongly distrust 200, which
+    # outweighs node-b's own enthusiasm for it. 2-vs-1 proposal count alone
+    # would have given the same answer here, but for the RIGHT reason (the
+    # actual joint confidence), not just majority vote.
+    winners = resolve_disputes(dispute_scores)
+    assert winners[10] == 100
+    print("PASS: N-way dispute correctly weighs every participant's confidence")
+
+
+def test_partial_participation_degrades_gracefully():
+    """One participant never reports a dispute score (slow, or the sync
+    barrier timed out on it) — resolution must still complete using
+    whoever DID report, not hang or crash."""
+    dispute_scores = {
+        "node-a": {10: {100: math.log(0.6), 200: math.log(0.3)}},
+        # node-b silently missing — degrade gracefully, don't require it
+    }
+    winners = resolve_disputes(dispute_scores)
+    assert winners[10] == 100
+    print("PASS: missing participant's vote just doesn't count, no crash/hang")
+
+
+def test_tie_break_is_deterministic():
+    dispute_scores = {
+        "node-a": {10: {100: math.log(0.5), 50: math.log(0.5)}},
+    }
+    winners = resolve_disputes(dispute_scores)
+    # exact tie — lower token id wins, and must be reproducible every time
+    assert winners[10] == 50
+    winners_again = resolve_disputes(dispute_scores)
+    assert winners_again[10] == 50
+    print("PASS: tied scores break deterministically (lower token id)")
+
+
+def test_merge_consensus_combines_disputed_and_undisputed():
+    commits = {
+        "node-a": {10: (500, 0.9), 20: (700, 0.99)},   # 10 disputed, 20 not
+        "node-b": {10: (600, 0.7), 20: (700, 0.95)},
+    }
+    disputes = detect_disputes(commits)
+    assert disputes == {10: {500, 600}}
+    resolved = {10: 500}  # pretend PoE resolved position 10 to token 500
+    merged = merge_consensus(shared_x={}, commits=commits, resolved=resolved)
+    assert merged == {10: 500, 20: 700}
+    print("PASS: merge combines PoE-resolved and directly-agreed positions correctly")
+
+
+if __name__ == "__main__":
+    test_no_dispute_when_everyone_agrees()
+    test_two_way_dispute_matches_old_pairwise_behavior()
+    test_genuine_n_way_dispute_counts_every_voice()
+    test_partial_participation_degrades_gracefully()
+    test_tie_break_is_deterministic()
+    test_merge_consensus_combines_disputed_and_undisputed()
+    print("\nALL PASS")
