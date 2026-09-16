@@ -1,25 +1,8 @@
 """
-The generation loop: wires the round-locking + consensus + model-step
-layers together into one running generation round, on top of a SwarmNode
-(node/swarm.py) rather than talking to the transport directly — see
-swarm.py's docstring for why that split exists (one poller, not two racing
-ones).
-
-HONEST STATUS: this file has NOT been run against a real model. Everything
-below it in this project's dependency chain (round-locking, consensus,
-stop-detection) is pure Python logic and has real passing tests with
-synthetic data. This file is where those pieces meet an actual GPU-backed
-model, tensors, and real network timing — none of which this sandbox can
-exercise. Treat this as a structurally-complete first draft to run and
-iterate on in Colab, not as verified code.
-
-Sync-window accounting, briefly: each node accumulates its own newly
-transferred positions across every step since the last sync (not just the
-single most recent step — a sync window can span several steps), broadcasts
-that accumulated set as one COMMIT, then resets the accumulator. This
-mirrors what the old 2-node version did by recomputing a `relevant` union
-at sync time; here it's tracked incrementally instead of recomputed, since
-there's no longer a single peer to diff against.
+node/generation.py — now with the step/sync visibility v7 had and this
+swarm port dropped. VERBOSE and DEBUG_EVERY work the same way they did in
+the old notebooks: progress prints every DEBUG_EVERY steps, plus a sync
+summary and a decoded partial-generation preview after every sync.
 """
 from dataclasses import dataclass
 
@@ -28,6 +11,9 @@ from node.swarm import SwarmNode
 from diffusion.local_step import local_step, StepConfig
 from diffusion.consensus import detect_disputes, resolve_disputes, merge_consensus
 from diffusion.stop_detection import StopDetector, StopConfig
+
+VERBOSE = True
+DEBUG_EVERY = 8  # print step progress every N steps, not every step
 
 
 @dataclass
@@ -49,10 +35,6 @@ class GenerationRunner:
         self.device = device
 
     def run_round(self, prompt_ids, gen_cfg: GenConfig):
-        """Runs one full generation round for this node, as a participant.
-        Assumes swarm.round_mgr.active_round is already set — either via
-        swarm.start_round_as_leader(...) if we're the leader, or
-        swarm.wait_for_round(...) if we're not."""
         round_state = self.swarm.round_mgr.active_round
         round_id = round_state.round_id
         participants = set(round_state.participants)
@@ -63,15 +45,16 @@ class GenerationRunner:
         num_blocks = gen_cfg.gen_length // gen_cfg.block_length
         steps_per_block = gen_cfg.steps // num_blocks
 
+        if VERBOSE:
+            print(f"[{self.id}] round {round_id}: {num_blocks} blocks x "
+                  f"{steps_per_block} steps/block ({gen_cfg.steps} total), "
+                  f"{len(participants)} participant(s): {sorted(participants)}")
+
         import torch
         x = torch.full((1, gen_end), gen_cfg.step_cfg.mask_id, dtype=torch.long, device=self.device)
         x[:, :gen_start] = prompt_ids
 
-        # shared_x tracks the converged consensus as {absolute_position: token},
-        # separately from the raw tensor `x` — makes stop-detection and
-        # consensus merging position-indexed and framework-agnostic, and
-        # keeps `x` as the thing actually fed back into the model each step.
-        shared_x: dict[int, int] = {p: prompt_ids[0, p].item() for p in range(gen_start)}
+        shared_x: dict = {p: prompt_ids[0, p].item() for p in range(gen_start)}
         stop_detector = StopDetector(gen_cfg.stop_cfg)
         frozen_from = None
 
@@ -80,10 +63,13 @@ class GenerationRunner:
             block_end = gen_start + (block_idx + 1) * gen_cfg.block_length
 
             if frozen_from is not None and block_start >= frozen_from:
+                if VERBOSE:
+                    print(f"[{self.id}] block {block_idx} is entirely past the "
+                          f"frozen boundary — skipping.")
                 break
 
             age = torch.zeros_like(x)
-            pending_commits: dict[int, tuple[int, float]] = {}  # this node's own, since last sync
+            pending_commits: dict = {}
 
             for step_idx in range(steps_per_block):
                 if self.swarm.round_mgr.check_leader_timeout():
@@ -99,17 +85,19 @@ class GenerationRunner:
                 for pos in torch.where(transfer[0])[0].tolist():
                     pending_commits[pos] = (x0[0, pos].item(), conf_new[0, pos].item())
 
+                if VERBOSE and (step_idx + 1) % DEBUG_EVERY == 0:
+                    n_masked = int((x[0, block_start:block_end] == gen_cfg.step_cfg.mask_id).sum())
+                    print(f"[{self.id}] block {block_idx} step {step_idx + 1}/{steps_per_block}: "
+                          f"{n_masked} masks remain in block")
+
                 is_last_step = (step_idx == steps_per_block - 1)
                 if (step_idx + 1) % gen_cfg.sync_every == 0 or is_last_step:
                     shared_x, frozen_from = self._do_sync(
                         round_id, participants, other_participants,
                         pending_commits, p, shared_x, gen_start, gen_end,
-                        stop_detector, frozen_from,
+                        stop_detector, frozen_from, block_idx, step_idx,
                     )
                     pending_commits = {}
-                    # Reconcile this node's own tensor with the converged
-                    # consensus for everything synced so far, same as the
-                    # old x_a = x_consensus.clone() step.
                     for pos, token in shared_x.items():
                         if block_start <= pos < block_end:
                             x[0, pos] = token
@@ -121,8 +109,7 @@ class GenerationRunner:
 
     def _do_sync(self, round_id, participants, other_participants,
                  my_commits, my_p, shared_x, gen_start, gen_end,
-                 stop_detector, frozen_from):
-        # --- phase 1: exchange COMMITs ---
+                 stop_detector, frozen_from, block_idx, step_idx):
         positions = list(my_commits.keys())
         self.swarm.transport.publish(self.id, protocol.COMMIT, {
             "round_id": round_id,
@@ -142,8 +129,7 @@ class GenerationRunner:
 
         disputes = detect_disputes(all_commits)
 
-        # --- phase 2: exchange DISPUTE_SCOREs, only if needed ---
-        resolved: dict[int, int] = {}
+        resolved: dict = {}
         if disputes:
             my_scores = {
                 pos: {tok: my_p[0, pos, tok].clamp_min(1e-12).log().item() for tok in tokens}
@@ -170,4 +156,16 @@ class GenerationRunner:
         new_frozen_from = stop_detector.check(shared_x, gen_start, gen_end)
         if new_frozen_from is not None and new_frozen_from != frozen_from:
             print(f"[{self.id}] stop boundary confirmed at {new_frozen_from - gen_start}")
+
+        if VERBOSE:
+            n_commits = sum(len(c) for c in all_commits.values())
+            print(f"[{self.id}] SYNC block {block_idx} step {step_idx + 1}: "
+                  f"{len(all_commits)} reporter(s), {n_commits} total commits, "
+                  f"{len(disputes)} disputed position(s)")
+            preview_tokens = [shared_x.get(p) for p in range(gen_start, gen_end) if p in shared_x]
+            if preview_tokens:
+                preview = self.tokenizer.decode(preview_tokens, skip_special_tokens=True)
+                print(f"[{self.id}] current generation:\n{preview}\n")
+
         return shared_x, new_frozen_from
+
