@@ -104,6 +104,9 @@ class RoundManager:
         now = now if now is not None else time.time()
         if self.active_round is None or self.active_round.status != "active":
             return False
+
+        if self.active_round.leader_id == self.self_id:
+            return False
         if now - self.active_round.last_leader_seen > config.ROUND_LEADER_TIMEOUT:
             print(f"[round] leader {self.active_round.leader_id} silent for "
                   f">{config.ROUND_LEADER_TIMEOUT}s — round "
