@@ -24,11 +24,30 @@ not a protocol that negotiates an answer.
 
 ## Why disputes need a second phase, and why it doesn't cost extra GPU work
 
-Faithful PoE means every ALIVE model's opinion on a candidate counts, not
-just the opinions of whichever two participants happened to propose
-different tokens. With N participants, resolving a dispute between "cat"
-and "dog" needs every participant's log-probability for BOTH "cat" and
+Faithful arbitration means every ALIVE model's opinion on a candidate
+counts, not just the opinions of whichever two participants happened to
+propose different tokens. With N participants, resolving a dispute between
+"cat" and "dog" needs every participant's probability for BOTH "cat" and
 "dog" — not just the two proposers'.
+
+IMPORTANT — this is a WEIGHTED-AVERAGE aggregation, not PoE, and that
+distinction is load-bearing, not stylistic. An earlier version of this
+module (and the docstring you may be reading a stale copy of) summed
+log-probabilities across participants — i.e. argmax of the PRODUCT of
+their probabilities, classic Product-of-Experts. That was already tried
+and deliberately abandoned in the 2-node version (DED_NodeB, the
+`W_A, W_B = 0.5, 0.5; score = W_A*p_a + W_B*p_b` change) for a concrete
+reason: PoE punishes genuine disagreement multiplicatively. If two
+participants each strongly prefer a DIFFERENT token, each assigns the
+other's pick a near-zero probability — under PoE that near-zero factor
+drags BOTH real candidates' scores toward zero, and a third, blander token
+that neither participant actually wanted but that both rate moderately
+(because neither actively objects to it) can out-score both genuine
+picks and win by default. A weighted SUM of raw probabilities doesn't
+have this failure mode: one participant's near-zero term just gets
+outweighed by the other's real confidence instead of nullifying it. See
+test_consensus.py's `test_bland_compromise_loses_under_weighted_average`
+for a worked example of exactly this failure and why the fix matters.
 
 The good news: nobody needs an extra forward pass to get this. Every
 participant already computed a full (seq_len, vocab) softmax distribution
@@ -77,20 +96,27 @@ def resolve_disputes(
 ) -> dict[int, int]:
     """dispute_scores: {node_id: {position: {candidate_token: log_prob}}}
 
-    Sums log-probs per candidate per position across whichever nodes
-    reported (see module docstring on graceful degradation), then picks the
-    highest-scoring candidate per position. Ties broken by lowest token id
-    — arbitrary but deterministic, which is the only property that matters
-    here: every participant computing this must land on the same winner.
+    Values arrive as log-probs (cheap to compute from each participant's own
+    softmax, and small over the wire), but aggregation happens in PROBABILITY
+    space — sum of exp(log_prob) per candidate, i.e. a weighted average
+    (uniform 1/N weight; the constant factor doesn't affect the argmax below)
+    — not a sum of log-probs. Summing logs would be Product-of-Experts, which
+    this module deliberately does NOT do — see the module docstring for why.
+
+    Picks the highest-scoring candidate per position. Ties broken by lowest
+    token id — arbitrary but deterministic, which is the only property that
+    matters here: every participant computing this must land on the same
+    winner.
 
     Returns {position: winning_token}.
     """
+    import math
     totals: dict[int, dict[int, float]] = {}
     for node_id, positions in dispute_scores.items():
         for pos, candidates in positions.items():
             bucket = totals.setdefault(pos, {})
             for token, logprob in candidates.items():
-                bucket[token] = bucket.get(token, 0.0) + logprob
+                bucket[token] = bucket.get(token, 0.0) + math.exp(logprob)
 
     winners = {}
     for pos, candidates in totals.items():
