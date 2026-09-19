@@ -1,25 +1,24 @@
 """
-SwarmNode: the piece that was missing. node/node.py's membership loop and
-node/generation.py's GenerationRunner each independently wanted to be the
-only thing calling transport.poll_recv() — fine in isolation (that's how
-each was tested), but wrong together: two independent pollers racing on
-the same SUB socket means whichever one happens to poll first "steals" a
-message the other needed, silently. A GenerationRunner mid-sync-barrier
-could miss a heartbeat; a membership loop could swallow a COMMIT meant for
-an active round.
+SwarmNode: the single socket poller everything else shares, now with a
+durable gen-message inbox.
 
-Fix: exactly ONE poller, here. Every incoming message passes through
-`_dispatch`, which routes it to whichever layer cares — PeerTable,
-RoundManager, or (during an active round's sync barrier) a queue that
-GenerationRunner reads from via `collect_until`. Membership bookkeeping
-(peer liveness, leader-activity resets) happens on EVERY message
-regardless of type, so a long sync wait doesn't let heartbeats go stale
-just because nothing was polling for them specifically.
+Why the inbox exists: check_leader_timeout() only gets fresh data when a
+message is actually read off the socket, which used to only happen inside
+collect_until — i.e. only at sync points. Between syncs (SYNC_EVERY steps
+of local_step, ~14s at this model's per-step cost), nothing was polling at
+all, so a follower could time out a perfectly healthy leader simply because
+nobody read the heartbeats sitting in the socket buffer. The fix
+(node/generation.py now polls every step, not just at syncs) creates a new
+risk on its own: a COMMIT/DISPUTE_SCORE that arrives early — while the
+receiver is still mid-block, not yet at ITS OWN collect_until call for that
+sync — would get read and silently discarded by an earlier incidental poll,
+and collect_until would then wrongly conclude that peer never reported.
 
-`node/node.py`'s standalone Node class is left as-is — it's the tested,
-working membership-only demo/harness (see tests/local_swarm_demo.sh) and
-there's no reason to disturb it. SwarmNode is the real integration point a
-notebook running actual generation should use instead.
+The inbox fixes that: every pump_once() files gen-protocol messages into a
+durable per-(msg_type, round_id, sync_seq) bucket, and collect_until checks
+that bucket FIRST before waiting for new arrivals. sync_seq (not just
+round_id) is required in the key because one round has many syncs — without
+it, a stale message from an earlier sync could satisfy a later sync's wait.
 """
 import time
 
@@ -35,12 +34,11 @@ class SwarmNode:
         self.transport = Transport(relays)
         self.peers = PeerTable(self_id=self_id, timeout=config.PEER_TIMEOUT)
         self.round_mgr = RoundManager(self_id=self_id)
+        self._gen_inbox: dict[tuple, dict[str, dict]] = {}
 
     def _dispatch(self, env: dict) -> dict:
         node_id, msg_type, ts = env["node_id"], env["type"], env["ts"]
         if node_id != self.id:
-            # ANY traffic from the round's current leader counts as proof
-            # it's alive — there's no separate "round heartbeat" message.
             self.round_mgr.note_leader_activity(node_id, ts)
             if msg_type in (protocol.HEARTBEAT, protocol.HELLO):
                 self.peers.mark_alive(node_id, ts)
@@ -50,52 +48,44 @@ class SwarmNode:
             self.round_mgr.on_gen_start(env)
         elif msg_type == protocol.GEN_DONE:
             self.round_mgr.on_gen_done(env)
+        elif msg_type in (protocol.COMMIT, protocol.DISPUTE_SCORE):
+            payload = env["payload"]
+            key = (msg_type, payload.get("round_id"), payload.get("sync_seq"))
+            self._gen_inbox.setdefault(key, {})[node_id] = payload
         return env
 
     def pump_once(self, timeout_ms: int = 100) -> dict | None:
-        """The ONE place transport.poll_recv() is ever called. Everything
-        else — membership loop, generation sync barriers — goes through
-        this, directly or via collect_until below."""
         env = self.transport.poll_recv(timeout_ms=timeout_ms)
         if env is not None:
             self._dispatch(env)
         return env
 
-    def collect_until(self, msg_type: str, round_id: str, expected_from: set[str],
-                       timeout: float) -> dict[str, dict]:
-        """Used by GenerationRunner during a sync barrier. Still routes
-        every message through _dispatch (so membership/round bookkeeping
-        stays live during the wait), but only RETURNS the ones matching
-        msg_type + round_id that this call is actually waiting for."""
-        received: dict[str, dict] = {}
+    def collect_until(self, msg_type: str, round_id: str, sync_seq: int,
+                       expected_from: set[str], timeout: float) -> dict[str, dict]:
+        key = (msg_type, round_id, sync_seq)
+        received = {k: v for k, v in self._gen_inbox.get(key, {}).items()
+                    if k in expected_from}
+        remaining = set(expected_from) - set(received.keys())
         deadline = time.time() + timeout
-        remaining = set(expected_from)
         while remaining and time.time() < deadline:
             env = self.pump_once(timeout_ms=100)
             if env is None:
                 continue
-            if env["type"] != msg_type or env["payload"].get("round_id") != round_id:
+            payload = env["payload"]
+            if (env["type"] != msg_type or payload.get("round_id") != round_id
+                    or payload.get("sync_seq") != sync_seq):
                 continue
             if env["node_id"] not in remaining and env["node_id"] not in received:
-                continue  # not an expected sender for this round — no vote
-            received[env["node_id"]] = env["payload"]
+                continue
+            received[env["node_id"]] = payload
             remaining.discard(env["node_id"])
+        self._gen_inbox.pop(key, None)
         return received
 
     def send_heartbeat(self):
         self.transport.publish(self.id, protocol.HEARTBEAT)
 
-    def start_heartbeat_thread(self) -> "threading.Thread":
-        """Runs send_heartbeat() every HEARTBEAT_INTERVAL seconds in the
-        background for the life of the process. Safe to run alongside the
-        main thread's pump_once/collect_until calls: this only ever touches
-        the PUB socket, main-thread code only ever touches the SUB socket
-        (via pump_once) — ZeroMQ sockets aren't thread-safe for concurrent
-        use from multiple threads, but that only matters per-socket, and
-        PUB/SUB here are two separate sockets. Needed because a notebook
-        cell waiting on peer discovery, or a GenerationRunner mid-round,
-        can't also be the one remembering to send heartbeats on a timer.
-        """
+    def start_heartbeat_thread(self):
         import threading
 
         def _loop():
@@ -119,9 +109,6 @@ class SwarmNode:
         return state
 
     def wait_for_round(self, timeout: float | None = None):
-        """Block until a round becomes active (via an incoming GEN_START
-        this node adopts) or timeout elapses. Returns the RoundState or
-        None on timeout."""
         deadline = None if timeout is None else time.time() + timeout
         while self.round_mgr.active_round is None:
             if deadline is not None and time.time() > deadline:
