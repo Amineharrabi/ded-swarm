@@ -37,15 +37,23 @@ class SwarmNode:
         self._gen_inbox: dict[tuple, dict[str, dict]] = {}
 
     def _dispatch(self, env: dict) -> dict:
-        node_id, msg_type, ts = env["node_id"], env["type"], env["ts"]
+        node_id, msg_type = env["node_id"], env["type"]
+        receive_ts = time.time()  # THE FIX: liveness is based on when we found
+                                   # out, not when the message claims it was sent.
+                                   # A message that sat unread during a long
+                                   # blocking call (cold-start GPU compile, etc.)
+                                   # still proves the sender is alive RIGHT NOW
+                                   # when it's finally read — using its stale
+                                   # embedded ts instead falsely treats a message
+                                   # received this instant as already-too-old.
         if node_id != self.id:
-            self.round_mgr.note_leader_activity(node_id, ts)
+            self.round_mgr.note_leader_activity(node_id, receive_ts)
             if msg_type in (protocol.HEARTBEAT, protocol.HELLO):
-                self.peers.mark_alive(node_id, ts)
+                self.peers.mark_alive(node_id, receive_ts)
             elif msg_type == protocol.BYE:
                 self.peers.mark_gone(node_id)
         if msg_type == protocol.GEN_START:
-            self.round_mgr.on_gen_start(env)
+            self.round_mgr.on_gen_start(env, adopted_at=receive_ts)
         elif msg_type == protocol.GEN_DONE:
             self.round_mgr.on_gen_done(env)
         elif msg_type in (protocol.COMMIT, protocol.DISPUTE_SCORE):
