@@ -39,7 +39,27 @@ ROUND_LEADER_TIMEOUT = 8.0   # slightly above PEER_TIMEOUT: give a live-but-slow
 # Per-sync barrier, used for BOTH phases of a sync (collecting COMMITs, then
 # collecting DISPUTE_SCOREs): how long to wait for every round participant's
 # message before proceeding with whatever arrived. A stalled participant
-# degrades that sync (fewer voices in the PoE sum, or its commits simply
-# missing this round) rather than freezing the whole swarm waiting on it —
-# see diffusion/consensus.py and node/generation.py.
-SYNC_BARRIER_TIMEOUT = 2.0
+# degrades that sync (fewer voices in the weighted-average sum, or its
+# commits simply missing this round) rather than freezing the whole swarm
+# waiting on it — see diffusion/consensus.py and node/generation.py.
+#
+# 2.0s was miscalibrated: it was sized like a network round-trip, but what
+# it actually has to cover is SYNC_EVERY full model forward passes on
+# whichever participant is slowest — seconds each, not milliseconds, even
+# before any network hop. At 2.0s, any real speed difference between
+# participants (different GPU, different quantization, a cold-start CUDA
+# compile on the first block) means the faster node's collect_until times
+# out before the slower one has even published — every single sync, not
+# just an occasional one. That's not "one stalled participant degrading
+# gracefully," it's a permanent 1-reporter/N-reporter split: the faster
+# node never sees anyone else's commits, so it never detects a dispute
+# (detect_disputes needs >=2 proposals) and just runs solo — which is
+# exactly why two nodes were observed producing two completely different
+# final outputs instead of one converged one.
+#
+# 45s is a rough, generous placeholder — big enough to absorb a slow first
+# block without needing to be re-tuned per model. The right way to size
+# this for real is per SYNC_EVERY: (measured seconds-per-step on your
+# slowest participant) * SYNC_EVERY + slack, not a constant divorced from
+# how many forward passes actually happen between syncs.
+SYNC_BARRIER_TIMEOUT = 45.0
